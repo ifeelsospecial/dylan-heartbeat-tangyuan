@@ -1,6 +1,7 @@
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
+const adapter = require("./anthropic_adapter");
 
 const TIMELINE_PATH = path.join(__dirname, "enhanced_messages.json");
 const PORT = Number(process.env.PORT) || 3000;
@@ -328,20 +329,49 @@ ${historyText}`
     return;
   }
 
-  const response = await fetch(process.env.TARGET_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.TARGET_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: process.env.MODEL_NAME,
-      messages: wakeMessages,
-      temperature: 0.8,
-      top_p: 0.95,
-      stream: false
-    })
-  });
+  const upstreamFormat = adapter.resolveUpstreamFormat(process.env.TARGET_API_URL);
+  let response;
+
+  if (upstreamFormat === "anthropic") {
+    // Anthropic 要求 messages 里至少有一条 user，且不能全是 system。
+    // 前两个 system（唤醒指令 + 人格 SP）上提到 system，
+    // 第三块（最近记录 + 后台唤醒说明）作为 user 消息发出。
+    const systemText = wakeMessages
+      .slice(0, 2)
+      .map(m => m.content)
+      .filter(Boolean)
+      .join("\n\n");
+    const userText = wakeMessages[2] ? wakeMessages[2].content : "（无最近记录）";
+
+    response = await fetch(adapter.resolveAnthropicUrl(process.env.TARGET_API_URL), {
+      method: "POST",
+      headers: adapter.anthropicHeaders(process.env.TARGET_API_KEY),
+      body: JSON.stringify({
+        model: process.env.MODEL_NAME,
+        max_tokens: Number(process.env.WAKE_MAX_TOKENS) || 1024,
+        system: systemText,
+        messages: [{ role: "user", content: userText }],
+        temperature: 0.8,
+        top_p: 0.95,
+        stream: false
+      })
+    });
+  } else {
+    response = await fetch(process.env.TARGET_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.TARGET_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: process.env.MODEL_NAME,
+        messages: wakeMessages,
+        temperature: 0.8,
+        top_p: 0.95,
+        stream: false
+      })
+    });
+  }
 
   const responseText = await response.text();
   let data;
@@ -357,7 +387,10 @@ ${historyText}`
   console.log("\nWake Result:\n");
   console.log(JSON.stringify(data, null, 2));
 
-  const aiText = normalizeContentToText(data.choices?.[0]?.message?.content).trim();
+  const aiText =
+    upstreamFormat === "anthropic"
+      ? adapter.extractAnthropicText(data)
+      : normalizeContentToText(data.choices?.[0]?.message?.content).trim();
   console.log("\nAI内容：\n");
   console.log(aiText);
 

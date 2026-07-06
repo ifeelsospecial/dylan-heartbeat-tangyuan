@@ -24,6 +24,21 @@ const TIMELINE_FILE = "enhanced_messages.json";
 const TIMESTAMP_DB_FILE = "./message_timestamps.json";
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up";
 
+const adapter = require("./anthropic_adapter");
+
+// 可选的入站鉴权：设置 GATEWAY_API_KEY 后，/v1/* 路由要求携带该密钥
+// （Kelivo 的 API Key 栏填同一个值即可；不设置则保持原来的无鉴权行为）
+function checkGatewayAuth(req, reply) {
+  const requiredKey = (process.env.GATEWAY_API_KEY || "").trim();
+  if (!requiredKey) return true;
+  const auth = req.headers["authorization"] || "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  const xKey = (req.headers["x-api-key"] || "").trim();
+  if (bearer === requiredKey || xKey === requiredKey) return true;
+  reply.code(401).send({ error: "无效的网关密钥（检查 Kelivo 里填的 API Key 是否与 GATEWAY_API_KEY 一致）" });
+  return false;
+}
+
 // ========================
 // 多模态消息处理
 // ========================
@@ -441,25 +456,33 @@ app.addHook("onRequest", (req, reply, done) => {
 // Models
 // ========================
 app.get("/v1/models", async (req, reply) => {
+  const modelId = (process.env.MODEL_NAME || "").trim() || "DeepSeek-V4-Pro";
+  // 同时满足 OpenAI 与 Anthropic 两种客户端的模型列表格式
   reply.send({
     object: "list",
-    data: [{ id: "DeepSeek-V4-Pro", object: "model", created: 0, owned_by: "gateway" }]
+    data: [
+      {
+        id: modelId,
+        object: "model",
+        type: "model",
+        display_name: modelId,
+        created: 0,
+        created_at: "2025-01-01T00:00:00Z",
+        owned_by: "gateway"
+      }
+    ],
+    has_more: false,
+    first_id: modelId,
+    last_id: modelId
   });
 });
 
 // ========================
-// Chat Completions
+// 网关核心流水线（两个入口路由共用）
+// 时间戳记忆 -> 时间线维护 -> 多模态归一 -> 事件注入 -> tool 修复
 // ========================
-app.post("/v1/chat/completions", async (req, reply) => {
-  try {
-    const body = req.body;
-    console.log("\n============================");
-    console.log("收到 Kelivo 完整请求 Body:");
-    console.log(JSON.stringify(sanitizeForLog(body), null, 2));
-    console.log("============================\n");
-
-    const kelivoMessages = body.messages || [];
-    const oldTimeline = loadTimeline();
+function runGatewayPipeline(kelivoMessages) {
+  const oldTimeline = loadTimeline();
 
     const tsDB = loadTimestampDB();
     let tsDBDirty = false;
@@ -583,30 +606,162 @@ app.post("/v1/chat/completions", async (req, reply) => {
       llmMessages.splice(idx, 1);
     }
 
+  return llmMessages;
+}
+
+// ========================
+// Chat Completions（OpenAI 格式入口）
+// 上游为 Anthropic 中转站时自动做出/入双向转换
+// ========================
+app.post("/v1/chat/completions", async (req, reply) => {
+  try {
+    if (!checkGatewayAuth(req, reply)) return;
+    const body = req.body;
+    console.log("\n============================");
+    console.log("收到 Kelivo 完整请求 Body (OpenAI 格式):");
+    console.log(JSON.stringify(sanitizeForLog(body), null, 2));
+    console.log("============================\n");
+
+    const kelivoMessages = body.messages || [];
+    const llmMessages = runGatewayPipeline(kelivoMessages);
+
     if (!TARGET_API_URL || !process.env.TARGET_API_KEY) {
       return reply.code(500).send({ error: "TARGET_API_URL / TARGET_API_KEY 未配置" });
     }
 
-    // 请求模型
-    const response = await fetch(TARGET_API_URL, {
+    const upstreamFormat = adapter.resolveUpstreamFormat(TARGET_API_URL);
+
+    // ---------- 上游是 OpenAI 格式：保持原有行为，原样转发 ----------
+    if (upstreamFormat === "openai") {
+      const response = await fetch(TARGET_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.TARGET_API_KEY}`
+        },
+        body: JSON.stringify({ ...body, messages: llmMessages })
+      });
+
+      if (!response.body) {
+        return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
+      }
+
+      reply.raw.writeHead(response.status, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      });
+
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        reply.raw.write(value);
+      }
+      reply.raw.end();
+      return;
+    }
+
+    // ---------- 上游是 Anthropic 格式：出口转换 ----------
+    const anthropicBody = adapter.buildAnthropicRequestFromOpenAI(body, llmMessages);
+    const anthropicUrl = adapter.resolveAnthropicUrl(TARGET_API_URL);
+    console.log(`上游格式: anthropic -> ${anthropicUrl}`);
+
+    const response = await fetch(anthropicUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.TARGET_API_KEY}`
-      },
-      body: JSON.stringify({ ...body, messages: llmMessages })
+      headers: adapter.anthropicHeaders(process.env.TARGET_API_KEY),
+      body: JSON.stringify(anthropicBody)
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`上游 Anthropic 错误 HTTP ${response.status}: ${errText.slice(0, 500)}`);
+      return reply.code(response.status).send({
+        error: { message: `上游返回 HTTP ${response.status}: ${errText.slice(0, 500)}` }
+      });
+    }
+
+    if (anthropicBody.stream) {
+      reply.raw.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      });
+      await adapter.pipeAnthropicStreamToOpenAI(response.body.getReader(), chunk =>
+        reply.raw.write(chunk)
+      );
+      reply.raw.end();
+      return;
+    }
+
+    const data = await response.json();
+    reply.send(adapter.anthropicResponseToOpenAI(data));
+  } catch (err) {
+    console.error(err);
+    if (!reply.sent) reply.code(500).send({ error: err.message });
+  }
+});
+
+// ========================
+// Messages（Anthropic 格式入口，给 Kelivo 的 Claude 供应商模式用）
+// 入口转换 -> 原有流水线 -> 出口还原 -> 响应原样透传
+// 透传意味着 thinking 块、tool_use、所有 SSE 事件原封不动回到 Kelivo
+// ========================
+app.post("/v1/messages", async (req, reply) => {
+  try {
+    if (!checkGatewayAuth(req, reply)) return;
+    const body = req.body;
+    console.log("\n============================");
+    console.log("收到 Kelivo 完整请求 Body (Anthropic 格式):");
+    console.log(JSON.stringify(sanitizeForLog(body), null, 2));
+    console.log("============================\n");
+
+    // 入口：Anthropic -> 内部 OpenAI 形状（thinking 块随行暗仓保存）
+    const kelivoMessages = adapter.anthropicRequestToInternalMessages(body);
+    const llmMessages = runGatewayPipeline(kelivoMessages);
+
+    if (!TARGET_API_URL || !process.env.TARGET_API_KEY) {
+      return reply.code(500).send({
+        type: "error",
+        error: { type: "api_error", message: "TARGET_API_URL / TARGET_API_KEY 未配置" }
+      });
+    }
+
+    // 出口：内部形状 -> Anthropic（system 上提、事件合并、thinking 还原）
+    const { system, messages } = adapter.internalMessagesToAnthropic(llmMessages);
+    if (!messages || messages.length === 0) {
+      return reply.code(400).send({
+        type: "error",
+        error: { type: "invalid_request_error", message: "转换后 messages 为空" }
+      });
+    }
+
+    const upstreamBody = { ...body, messages };
+    if (system) upstreamBody.system = system;
+    else delete upstreamBody.system;
+
+    const anthropicUrl = adapter.resolveAnthropicUrl(TARGET_API_URL);
+    console.log(`Anthropic 直通 -> ${anthropicUrl}`);
+
+    const response = await fetch(anthropicUrl, {
+      method: "POST",
+      headers: adapter.anthropicHeaders(process.env.TARGET_API_KEY),
+      body: JSON.stringify(upstreamBody)
     });
 
     if (!response.body) {
-      return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
+      return reply.code(response.status).send({
+        type: "error",
+        error: { type: "api_error", message: "上游 API 没有返回可读取的响应体" }
+      });
     }
 
+    // 响应原样透传（流式/非流式、成功/报错都直接照搬，方便排查）
     reply.raw.writeHead(response.status, {
-      "Content-Type": "text/event-stream",
+      "Content-Type": response.headers.get("content-type") || "application/json",
       "Cache-Control": "no-cache",
       Connection: "keep-alive"
     });
-
     const reader = response.body.getReader();
     while (true) {
       const { done, value } = await reader.read();
@@ -616,7 +771,9 @@ app.post("/v1/chat/completions", async (req, reply) => {
     reply.raw.end();
   } catch (err) {
     console.error(err);
-    reply.code(500).send({ error: err.message });
+    if (!reply.sent) {
+      reply.code(500).send({ type: "error", error: { type: "api_error", message: err.message } });
+    }
   }
 });
 
