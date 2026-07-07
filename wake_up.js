@@ -3,7 +3,8 @@ const fs = require("fs");
 const path = require("path");
 const adapter = require("./anthropic_adapter");
 
-const TIMELINE_PATH = path.join(__dirname, "enhanced_messages.json");
+const DATA_DIR = (process.env.DATA_DIR || "").trim();
+const TIMELINE_PATH = DATA_DIR ? path.join(DATA_DIR, "enhanced_messages.json") : path.join(__dirname, "enhanced_messages.json");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;

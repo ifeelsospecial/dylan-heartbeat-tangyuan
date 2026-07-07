@@ -20,8 +20,17 @@ app.register(require("@fastify/formbody"));
 
 const PORT = Number(process.env.PORT) || 3000;
 const TARGET_API_URL = process.env.TARGET_API_URL;
-const TIMELINE_FILE = "enhanced_messages.json";
-const TIMESTAMP_DB_FILE = "./message_timestamps.json";
+
+// 持久化数据目录：在 Render 等临时文件系统平台上，把 DATA_DIR 指向挂载的
+// Persistent Disk（如 /data），时间线记忆就能在重新部署/重启后存活。
+// 不设置 DATA_DIR 时保持原行为（写在当前目录），VPS 用户不受影响。
+const path = require("path");
+const DATA_DIR = (process.env.DATA_DIR || "").trim();
+if (DATA_DIR) fs.ensureDirSync(DATA_DIR);
+const dataPath = (name) => (DATA_DIR ? path.join(DATA_DIR, name) : name);
+
+const TIMELINE_FILE = dataPath("enhanced_messages.json");
+const TIMESTAMP_DB_FILE = dataPath("message_timestamps.json");
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up";
 
 const adapter = require("./anthropic_adapter");
@@ -360,7 +369,7 @@ let wakeUpLastHeartbeat = null;
 // ========================
 // 预设方案
 // ========================
-const PRESETS_FILE = "./presets.json";
+const PRESETS_FILE = dataPath("presets.json");
 const ENV_FILE = ".env";
 const PREFERRED_ENV_ORDER = [
   "TARGET_API_URL",
